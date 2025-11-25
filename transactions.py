@@ -157,10 +157,20 @@ class TransactionProcessor:
     def create_smart_contract(self, sender_id: str, receiver_id: str, amount: float, 
                              contract_type: SmartContractType, execution_delay_hours: int = 0) -> Optional[SmartContract]:
         """Создание смарт-контракта"""
+        from models import UserType
+        
         sender = self.user_manager.get_user(sender_id)
         receiver = self.user_manager.get_user(receiver_id)
         
         if not sender or not receiver:
+            return None
+        
+        # Проверка: отправитель должен быть физическим лицом
+        if sender.user_type != UserType.INDIVIDUAL:
+            return None
+        
+        # Проверка: получатель должен быть юридическим лицом или гос учреждением
+        if receiver.user_type not in [UserType.LEGAL, UserType.CENTRAL_BANK]:
             return None
         
         bank = self.user_manager.get_bank(sender.bank_id) if sender.bank_id else None

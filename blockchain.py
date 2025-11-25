@@ -5,6 +5,7 @@ from models import Block, Transaction
 from crypto import CryptoService
 from consensus import RaftConsensus
 from participants import CentralBank, FinancialOrganization
+from database import DatabaseManager
 from datetime import datetime
 from typing import List, Dict, Optional
 import hashlib
@@ -14,7 +15,8 @@ import time
 class Blockchain:
     """Распределенный реестр (блокчейн)"""
     
-    def __init__(self, consensus: RaftConsensus, central_bank: CentralBank, banks: Dict[str, FinancialOrganization]):
+    def __init__(self, consensus: RaftConsensus, central_bank: CentralBank,
+                 banks: Dict[str, FinancialOrganization], database: DatabaseManager):
         self.chain: List[Block] = []
         self.consensus = consensus
         self.central_bank = central_bank
@@ -22,6 +24,7 @@ class Blockchain:
         self.nodes: Dict[str, List[Block]] = {}  # Распределение блоков по узлам
         self.genesis_block_created = False
         self.metrics = {'block_creation_times': [], 'block_registry_times': []}
+        self.database = database
     
     def create_genesis_block(self):
         """Создание генезис-блока"""
@@ -47,6 +50,7 @@ class Blockchain:
         genesis_block.signatures.append(signature)
         
         self.chain.append(genesis_block)
+        self.database.save_block(genesis_block)
         self._distribute_block(genesis_block)
         self.genesis_block_created = True
     
@@ -101,6 +105,7 @@ class Blockchain:
         # Запись в реестр
         registry_start = time.time()
         self.chain.append(block)
+        self.database.save_block(block)
         self._distribute_block(block)
         
         # Обновление метрик
@@ -112,6 +117,7 @@ class Blockchain:
         # Обновление транзакций с хешем блока
         for tx in transactions:
             tx.block_hash = block.block_hash
+            self.database.save_transaction(tx)
         
         return block
     
@@ -121,12 +127,24 @@ class Blockchain:
         if self.central_bank.bank_id not in self.nodes:
             self.nodes[self.central_bank.bank_id] = []
         self.nodes[self.central_bank.bank_id].append(block)
+        self.database.save_block_registry_event(
+            block.block_id,
+            self.central_bank.bank_id,
+            status="registered",
+            details="Блок записан в реестр ЦБ"
+        )
         
         # Распределение по ФО (каждый получает копию)
         for bank_id in self.banks.keys():
             if bank_id not in self.nodes:
                 self.nodes[bank_id] = []
             self.nodes[bank_id].append(block)
+            self.database.save_block_registry_event(
+                block.block_id,
+                bank_id,
+                status="replicated",
+                details="Блок реплицирован в узел ФО"
+            )
     
     def verify_chain(self) -> bool:
         """Проверка целостности цепочки"""

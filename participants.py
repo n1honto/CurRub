@@ -56,7 +56,7 @@ class FinancialOrganization:
             return True
         return False
     
-    def top_up_digital_wallet(self, user: User, amount: float) -> bool:
+    def top_up_digital_wallet(self, user: User, amount: float, transaction_processor=None) -> bool:
         """Пополнение цифрового кошелька"""
         if user.digital_wallet_status != WalletStatus.OPEN:
             return False
@@ -65,6 +65,26 @@ class FinancialOrganization:
         
         user.non_cash_balance -= amount
         user.digital_wallet_balance += amount
+        
+        # Создание транзакции пополнения
+        if transaction_processor:
+            from models import Transaction, TransactionType, TransactionStatus
+            import uuid
+            tx_id = f"TOPUP_{uuid.uuid4().hex[:12]}"
+            topup_tx = Transaction(
+                transaction_id=tx_id,
+                sender_id=user.user_id,  # Отправитель - сам пользователь
+                receiver_id=user.user_id,  # Получатель - сам пользователь
+                amount=amount,
+                transaction_type=TransactionType.WALLET_TOPUP,
+                status=TransactionStatus.CONFIRMED,
+                timestamp=datetime.now(),
+                bank_id=user.bank_id or self.bank_id
+            )
+            transaction_processor.transactions.append(topup_tx)
+            transaction_processor.pending_transactions.append(topup_tx)
+            transaction_processor.database.save_transaction(topup_tx)
+        
         return True
     
     def withdraw_from_digital_wallet(self, user: User, amount: float) -> bool:
@@ -87,7 +107,7 @@ class FinancialOrganization:
             return True
         return False
     
-    def top_up_offline_wallet(self, user: User, amount: float) -> bool:
+    def top_up_offline_wallet(self, user: User, amount: float, transaction_processor=None) -> bool:
         """Пополнение офлайн кошелька"""
         if user.offline_wallet_status != WalletStatus.OPEN:
             return False
@@ -99,6 +119,26 @@ class FinancialOrganization:
         
         user.digital_wallet_balance -= amount
         user.offline_wallet_balance += amount
+        
+        # Создание транзакции пополнения офлайн кошелька
+        if transaction_processor:
+            from models import Transaction, TransactionType, TransactionStatus
+            import uuid
+            tx_id = f"OTOPUP_{uuid.uuid4().hex[:12]}"
+            topup_tx = Transaction(
+                transaction_id=tx_id,
+                sender_id=user.user_id,
+                receiver_id=user.user_id,
+                amount=amount,
+                transaction_type=TransactionType.OFFLINE_WALLET_TOPUP,
+                status=TransactionStatus.CONFIRMED,
+                timestamp=datetime.now(),
+                bank_id=user.bank_id or self.bank_id
+            )
+            transaction_processor.transactions.append(topup_tx)
+            transaction_processor.pending_transactions.append(topup_tx)
+            transaction_processor.database.save_transaction(topup_tx)
+        
         return True
     
     def validate_transaction(self, sender: User, amount: float) -> bool:

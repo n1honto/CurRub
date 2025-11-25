@@ -85,6 +85,31 @@ class BlockDB(Base):
     node_id = Column(String, nullable=True)
 
 
+class BlockRegistryDB(Base):
+    """Таблица событий записи блоков в реестр"""
+    __tablename__ = 'block_registry'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    block_id = Column(String)
+    node_id = Column(String)
+    timestamp = Column(DateTime)
+    status = Column(String)
+    details = Column(Text, nullable=True)
+
+
+class EmissionRequestDB(Base):
+    """Таблица запросов на эмиссию"""
+    __tablename__ = 'emission_requests'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    bank_id = Column(String)
+    amount = Column(Float)
+    timestamp = Column(DateTime)
+    status = Column(String)
+    approved = Column(Boolean, default=False)
+    manual = Column(Boolean, default=False)
+
+
 class DatabaseManager:
     """Менеджер базы данных"""
     
@@ -234,6 +259,79 @@ class DatabaseManager:
         session = self.get_session()
         try:
             return session.query(BlockDB).order_by(BlockDB.timestamp).all()
+        finally:
+            session.close()
+
+    def save_block_registry_event(self, block_id: str, node_id: str, status: str, details: str = ""):
+        """Сохранение события записи блока"""
+        session = self.get_session()
+        try:
+            event = BlockRegistryDB(
+                block_id=block_id,
+                node_id=node_id,
+                timestamp=datetime.now(),
+                status=status,
+                details=details
+            )
+            session.add(event)
+            session.commit()
+        finally:
+            session.close()
+
+    def get_block_registry_events(self, limit: int = 50):
+        """Получение последних событий реестра"""
+        session = self.get_session()
+        try:
+            return (
+                session.query(BlockRegistryDB)
+                .order_by(BlockRegistryDB.timestamp.desc())
+                .limit(limit)
+                .all()
+            )
+        finally:
+            session.close()
+
+    def save_emission_request(self, bank_id: str, amount: float, timestamp: datetime,
+                              status: str = 'pending', approved: bool = False, manual: bool = False) -> int:
+        """Сохранение запроса на эмиссию"""
+        session = self.get_session()
+        try:
+            request = EmissionRequestDB(
+                bank_id=bank_id,
+                amount=amount,
+                timestamp=timestamp,
+                status=status,
+                approved=approved,
+                manual=manual
+            )
+            session.add(request)
+            session.commit()
+            return request.id
+        finally:
+            session.close()
+
+    def update_emission_request_status(self, request_id: int, status: str, approved: bool):
+        """Обновление статуса запроса на эмиссию"""
+        session = self.get_session()
+        try:
+            request = session.get(EmissionRequestDB, request_id)
+            if request:
+                request.status = status
+                request.approved = approved
+                session.commit()
+        finally:
+            session.close()
+
+    def get_recent_emission_requests(self, limit: int = 50):
+        """Получение последних запросов на эмиссию"""
+        session = self.get_session()
+        try:
+            return (
+                session.query(EmissionRequestDB)
+                .order_by(EmissionRequestDB.timestamp.desc())
+                .limit(limit)
+                .all()
+            )
         finally:
             session.close()
 

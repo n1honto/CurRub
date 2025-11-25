@@ -84,50 +84,152 @@ class RaftNode:
         })
     
     def form_block(self, transactions: List, previous_hash: str) -> Optional[Dict]:
-        """Формирование блока"""
+        """Формирование блока с расширенной логикой консенсуса"""
         if self.state != NodeState.LEADER:
             return None
         
         start_time = time.time()
         
+        # Валидация транзакций перед формированием блока
+        if not transactions or len(transactions) == 0:
+            return None
+        
+        # Создание записи в логе лидера
+        log_entry = {
+            'index': len(self.log),
+            'term': self.current_term,
+            'transactions': transactions,
+            'previous_hash': previous_hash,
+            'timestamp': datetime.now()
+        }
+        self.log.append(log_entry)
+        
         # Сбор транзакций в блок
+        block_id = f"BLOCK_{len(self.blocks_formed) + 1}_{self.current_term}"
         block_data = {
-            'block_id': f"BLOCK_{len(self.blocks_formed) + 1}",
+            'block_id': block_id,
             'previous_hash': previous_hash,
             'transactions': transactions,
             'timestamp': datetime.now(),
             'term': self.current_term,
-            'node_id': self.node_id
+            'node_id': self.node_id,
+            'log_index': log_entry['index']
         }
         
-        # Распространение блока для подтверждения
+        # Отправка AppendEntries запросов к followers для подтверждения
+        append_entries_responses = []
+        active_followers = [n for n in self.other_nodes if n.state == NodeState.FOLLOWER]
+        
+        for follower in active_followers:
+            # Отправка heartbeat и блока
+            response = self._send_append_entries(follower, log_entry)
+            append_entries_responses.append(response)
+        
+        # Подсчет подтверждений (quorum)
         confirmations = 1  # Лидер подтверждает сам
-        for node in self.other_nodes:
-            if node.state == NodeState.FOLLOWER:
+        for response in append_entries_responses:
+            if response.get('success', False):
                 confirmations += 1
         
-        # Если получили большинство подтверждений
+        # Если получили большинство подтверждений (quorum)
         total_nodes = len(self.other_nodes) + 1
-        if confirmations > total_nodes / 2:
+        quorum_needed = (total_nodes // 2) + 1
+        
+        if confirmations >= quorum_needed:
+            # Коммит записи в логе
+            self.commit_index = log_entry['index']
+            
+            # Применение коммита к другим узлам
+            for follower in active_followers:
+                if follower.commit_index < self.commit_index:
+                    follower.commit_index = self.commit_index
+                    follower.last_applied = self.commit_index
+            
             formation_time = (time.time() - start_time) * 1000  # в миллисекундах
             block_data['formation_time'] = formation_time
             block_data['confirmations'] = confirmations
+            block_data['quorum_reached'] = True
             
             self.blocks_formed.append(block_data)
             self.block_formation_times.append(formation_time)
             
-            # Распространение блока на все узлы
+            # Распространение блока на все узлы для синхронизации
             for node in self.other_nodes:
                 node.receive_block(block_data)
             
             return block_data
+        else:
+            # Недостаточно подтверждений - откат записи
+            if self.log and self.log[-1]['index'] == log_entry['index']:
+                self.log.pop()
+            return None
+    
+    def _send_append_entries(self, follower: 'RaftNode', log_entry: Dict) -> Dict:
+        """Отправка AppendEntries запроса к follower"""
+        # Проверка соответствия термина
+        if follower.current_term > self.current_term:
+            return {'success': False, 'reason': 'follower_term_higher'}
         
-        return None
+        # Обновление heartbeat
+        follower.receive_heartbeat(self.node_id, self.current_term)
+        
+        # Проверка предыдущей записи для консистентности
+        prev_log_index = log_entry['index'] - 1
+        if prev_log_index >= 0 and prev_log_index < len(follower.log):
+            prev_entry = follower.log[prev_log_index]
+            # Проверка соответствия предыдущей записи
+            if prev_entry.get('term') != log_entry.get('term') - 1:
+                # Несоответствие - требуется синхронизация
+                follower.log = self.log[:log_entry['index']].copy()
+        
+        # Добавление новой записи
+        if log_entry['index'] >= len(follower.log):
+            follower.log.append(log_entry)
+        else:
+            follower.log[log_entry['index']] = log_entry
+        
+        return {'success': True, 'follower_id': follower.node_id}
     
     def receive_block(self, block_data: Dict):
-        """Получение блока от лидера"""
-        self.log.append(block_data)
-        self.commit_index = len(self.log) - 1
+        """Получение блока от лидера с синхронизацией"""
+        # Проверка термина
+        if block_data.get('term', 0) < self.current_term:
+            return  # Устаревший блок
+        
+        # Обновление термина если нужно
+        if block_data.get('term', 0) > self.current_term:
+            self.current_term = block_data['term']
+            self.state = NodeState.FOLLOWER
+        
+        # Синхронизация лога
+        log_index = block_data.get('log_index', -1)
+        if log_index >= 0:
+            # Проверка консистентности
+            if log_index < len(self.log):
+                # Замена существующей записи
+                self.log[log_index] = {
+                    'index': log_index,
+                    'term': block_data['term'],
+                    'transactions': block_data['transactions'],
+                    'previous_hash': block_data.get('previous_hash', ''),
+                    'timestamp': block_data.get('timestamp', datetime.now())
+                }
+            else:
+                # Добавление новой записи
+                while len(self.log) < log_index:
+                    self.log.append({})  # Заполнение пустыми записями
+                self.log.append({
+                    'index': log_index,
+                    'term': block_data['term'],
+                    'transactions': block_data['transactions'],
+                    'previous_hash': block_data.get('previous_hash', ''),
+                    'timestamp': block_data.get('timestamp', datetime.now())
+                })
+            
+            # Обновление commit_index если лидер подтвердил
+            if block_data.get('quorum_reached', False):
+                self.commit_index = log_index
+                self.last_applied = log_index
 
 
 class RaftConsensus:
@@ -194,11 +296,20 @@ class RaftConsensus:
         if not leader:
             return {}
         
+        # Подсчет активных узлов
+        active_nodes = sum(1 for n in self.nodes.values() if n.state != NodeState.CANDIDATE)
+        followers_count = sum(1 for n in self.nodes.values() if n.state == NodeState.FOLLOWER)
+        
         return {
             'total_transaction_hashes': len(leader.transaction_hashes),
             'total_blocks_formed': len(leader.blocks_formed),
             'avg_block_formation_time': sum(leader.block_formation_times) / len(leader.block_formation_times) if leader.block_formation_times else 0,
             'current_term': leader.current_term,
-            'leader_id': leader.node_id
+            'leader_id': leader.node_id,
+            'total_nodes': len(self.nodes),
+            'active_nodes': active_nodes,
+            'followers_count': followers_count,
+            'leader_log_size': len(leader.log),
+            'leader_commit_index': leader.commit_index
         }
 

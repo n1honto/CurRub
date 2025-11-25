@@ -50,8 +50,9 @@ class DigitalRubleSystem:
     def create_banks(self, count: int) -> List[str]:
         """Создание банков"""
         bank_ids = []
+        start_index = len(self.user_manager.banks)
         for i in range(count):
-            bank_id = f"BANK_{i+1}"
+            bank_id = f"BANK_{start_index + i + 1}"
             bank = self.user_manager.create_bank(bank_id)
             self.database.save_user(bank.user)
             bank_ids.append(bank_id)
@@ -72,6 +73,14 @@ class DigitalRubleSystem:
             user_ids.append(user.user_id)
         
         return user_ids
+
+    def create_user_for_bank(self, user_type: UserType, bank_id: str) -> str:
+        """Создание одного пользователя для конкретного банка"""
+        if not bank_id or bank_id not in self.user_manager.banks:
+            raise ValueError("Выберите существующий банк для пользователя")
+        user = self.user_manager.create_user(user_type, bank_id)
+        self.database.save_user(user)
+        return user.user_id
     
     def setup_consensus_and_blockchain(self):
         """Настройка консенсуса и блокчейна"""
@@ -80,9 +89,49 @@ class DigitalRubleSystem:
         self.blockchain = Blockchain(
             self.consensus,
             self.central_bank,
-            self.user_manager.banks
+            self.user_manager.banks,
+            self.database
         )
         self.blockchain.create_genesis_block()
+
+    def submit_emission_request(self, bank_id: str, amount: float, manual: bool = False) -> Dict:
+        """Создание запроса на эмиссию и сохранение в БД"""
+        bank = self.user_manager.get_bank(bank_id)
+        if not bank:
+            raise ValueError("Банк не найден")
+        request = bank.request_emission(amount)
+        record = {
+            'bank_id': bank_id,
+            'amount': amount,
+            'timestamp': request['timestamp'],
+            'status': 'pending',
+            'approved': False,
+            'manual': manual
+        }
+        record_id = self.database.save_emission_request(
+            bank_id=record['bank_id'],
+            amount=record['amount'],
+            timestamp=record['timestamp'],
+            status=record['status'],
+            approved=record['approved'],
+            manual=manual
+        )
+        record['id'] = record_id
+        self.emission_requests.append(record)
+        self._notify_callback('emission_request', record)
+        return record
+
+    def finalize_emission_request(self, record: Dict) -> bool:
+        """Обработка запроса на эмиссию ЦБ"""
+        if not self.central_bank:
+            raise ValueError("Центральный банк не инициализирован")
+        approved = self.central_bank.process_emission_request(record['bank_id'], record['amount'])
+        record['status'] = 'approved' if approved else 'rejected'
+        record['approved'] = approved
+        self.database.update_emission_request_status(record['id'], record['status'], approved)
+        if approved:
+            self._notify_callback('emission_approved', {'bank_id': record['bank_id'], 'amount': record['amount']})
+        return approved
     
     def start_simulation(self, scenario: int = 1, custom_config: Optional[Dict] = None, incident_config: Optional[Dict] = None):
         """Запуск симуляции"""
@@ -158,14 +207,26 @@ class DigitalRubleSystem:
         incident_tx_interval = random.randint(700, 1200)  # Инциденты каждые 700-1200 транзакций
         incident_count = 0
         max_incidents = 10  # Максимум инцидентов за симуляцию
+        last_wallet_topup_time = start_time
+        wallet_topup_interval = 5  # Пополнение кошельков каждые 5 секунд
+        last_smart_contract_execution = start_time
+        smart_contract_execution_interval = 10  # Выполнение смарт-контрактов каждые 10 секунд
         
         users = [u for u in self.user_manager.get_all_users() 
                 if u.user_type in [UserType.INDIVIDUAL, UserType.LEGAL]]
         
-        while self.simulation_running:
+        # Отслеживание пополнений кошельков для каждого пользователя
+        digital_wallet_topup_count = {}  # user_id -> количество пополнений
+        offline_wallet_topup_count = {}  # user_id -> количество пополнений
+        
+        iteration_count = 0
+        max_iterations = duration_seconds * 10  # Максимум итераций для безопасности
+        
+        while self.simulation_running and iteration_count < max_iterations:
+            iteration_count += 1
             current_time = time.time()
             
-            # Строгая проверка времени - не более 2 минут
+            # Строгая проверка времени - не более заданного времени
             elapsed = current_time - start_time
             if elapsed >= duration_seconds:
                 break
@@ -181,21 +242,11 @@ class DigitalRubleSystem:
             if current_time - last_emission_time >= emission_interval and self.user_manager.banks:
                 bank = random.choice(list(self.user_manager.banks.values()))
                 amount = random.uniform(50000, 500000)
-                request = bank.request_emission(amount)
-                self.emission_requests.append({
-                    **request,
-                    'status': 'pending',
-                    'approved': False
-                })
-                self._notify_callback('emission_request', request)
+                record = self.submit_emission_request(bank.bank_id, amount)
                 last_emission_time = current_time
                 
                 # Обработка запроса ЦБ
-                approved = self.central_bank.process_emission_request(bank.bank_id, amount)
-                if approved:
-                    self.emission_requests[-1]['status'] = 'approved'
-                    self.emission_requests[-1]['approved'] = True
-                    self._notify_callback('emission_approved', {'bank_id': bank.bank_id, 'amount': amount})
+                self.finalize_emission_request(record)
             
             # Автоматическая симуляция инцидентов (по количеству транзакций)
             # Инцидент "cb_fo_2_failure" исключен из автоматических - только ручной запуск
@@ -216,75 +267,150 @@ class DigitalRubleSystem:
                     incident_tx_interval = random.randint(700, 1200)
                 last_incident_tx_count = tx_count
             
-            # Создание цифровых кошельков
-            for user in random.sample(users, min(10, len(users))):
+            # Создание цифровых кошельков (только если их нет)
+            for user in random.sample(users, min(5, len(users))):
                 if user.digital_wallet_status.value == "ЗАКРЫТ":
                     bank = self.user_manager.get_bank(user.bank_id)
                     if bank:
                         bank.create_wallet(user)
-                        bank.top_up_digital_wallet(user, random.uniform(100, 1000))
+                        topup_amount = random.uniform(100, 1000)
+                        bank.top_up_digital_wallet(user, topup_amount, self.transaction_processor)
                         self.database.save_user(user)
                         self._notify_callback('user_updated', user)
             
-            # Создание офлайн кошельков
-            for user in random.sample(users, min(5, len(users))):
+            # Периодическое пополнение цифровых кошельков (1-2 раза на пользователя)
+            if current_time - last_wallet_topup_time >= wallet_topup_interval:
+                users_with_wallets = [u for u in users 
+                                    if u.digital_wallet_status.value == "ОТКРЫТ" 
+                                    and digital_wallet_topup_count.get(u.user_id, 0) < 2
+                                    and u.non_cash_balance > 0]
+                if users_with_wallets:
+                    for user in random.sample(users_with_wallets, min(len(users_with_wallets), 10)):
+                        bank = self.user_manager.get_bank(user.bank_id)
+                        if bank and user.non_cash_balance > 0:
+                            topup_amount = min(random.uniform(50, 500), user.non_cash_balance)
+                            if bank.top_up_digital_wallet(user, topup_amount, self.transaction_processor):
+                                digital_wallet_topup_count[user.user_id] = digital_wallet_topup_count.get(user.user_id, 0) + 1
+                                self.database.save_user(user)
+                                self._notify_callback('user_updated', user)
+                last_wallet_topup_time = current_time
+            
+            # Создание офлайн кошельков (только если их нет)
+            for user in random.sample(users, min(3, len(users))):
                 if user.digital_wallet_status.value == "ОТКРЫТ" and user.offline_wallet_status.value == "ЗАКРЫТ":
                     bank = self.user_manager.get_bank(user.bank_id)
                     if bank and user.digital_wallet_balance > 0:
                         bank.create_offline_wallet(user)
                         amount = min(random.uniform(50, 200), user.digital_wallet_balance)
-                        bank.top_up_offline_wallet(user, amount)
+                        bank.top_up_offline_wallet(user, amount, self.transaction_processor)
                         self.database.save_user(user)
                         self._notify_callback('user_updated', user)
             
-            # Создание онлайн транзакций
-            for _ in range(min(20, target_tx - tx_count)):
-                if not users:
-                    break
-                sender = random.choice(users)
-                receiver = random.choice([u for u in users if u.user_id != sender.user_id])
-                
-                if sender.digital_wallet_balance > 0:
-                    amount = min(random.uniform(10, 500), sender.digital_wallet_balance)
-                    tx = self.transaction_processor.create_online_transaction(
-                        sender.user_id, receiver.user_id, amount
-                    )
-                    if tx:
-                        tx_count += 1
-                        self._notify_callback('transaction_created', tx)
+            # Периодическое пополнение офлайн кошельков (1-2 раза на пользователя)
+            if current_time - last_wallet_topup_time >= wallet_topup_interval:
+                users_with_offline_wallets = [u for u in users 
+                                             if u.offline_wallet_status.value == "ОТКРЫТ" 
+                                             and u.digital_wallet_balance > 0
+                                             and offline_wallet_topup_count.get(u.user_id, 0) < 2]
+                if users_with_offline_wallets:
+                    for user in random.sample(users_with_offline_wallets, min(len(users_with_offline_wallets), 10)):
+                        bank = self.user_manager.get_bank(user.bank_id)
+                        if bank:
+                            topup_amount = min(random.uniform(20, 100), user.digital_wallet_balance)
+                            if bank.top_up_offline_wallet(user, topup_amount, self.transaction_processor):
+                                offline_wallet_topup_count[user.user_id] = offline_wallet_topup_count.get(user.user_id, 0) + 1
+                                self.database.save_user(user)
+                                self._notify_callback('user_updated', user)
+            
+            # Создание онлайн транзакций (основной тип транзакций - 50% от целевого числа)
+            online_users = [u for u in users if u.digital_wallet_status.value == "ОТКРЫТ" and u.digital_wallet_balance > 0]
+            if len(online_users) >= 2:
+                # Рассчитываем сколько транзакций нужно создать
+                remaining_time = max(0.1, duration_seconds - elapsed)
+                remaining_tx = target_tx - tx_count
+                if remaining_tx > 0 and remaining_time > 0:
+                    # Целевая скорость: сколько транзакций в секунду нужно создать
+                    target_rate = remaining_tx / remaining_time
+                    # Создаем пропорционально времени (увеличено для полного объема)
+                    online_tx_per_iteration = min(50, max(1, int(target_rate * 0.5 * 0.05)))  # 50% онлайн, за 0.05 сек
+                    
+                    for _ in range(online_tx_per_iteration):
+                        if tx_count >= target_tx:
+                            break
+                        sender = random.choice(online_users)
+                        receiver = random.choice([u for u in online_users if u.user_id != sender.user_id and u.digital_wallet_status.value == "ОТКРЫТ"])
                         
-                        # Добавление хеша в консенсус
-                        tx_hash = tx.calculate_hash()
-                        self.consensus.add_transaction_hash(tx_hash)
+                        if sender.digital_wallet_balance > 0:
+                            amount = min(random.uniform(10, 500), sender.digital_wallet_balance * 0.9)  # Максимум 90% баланса
+                            tx = self.transaction_processor.create_online_transaction(
+                                sender.user_id, receiver.user_id, amount
+                            )
+                            if tx:
+                                tx_count += 1
+                                self._notify_callback('transaction_created', tx)
+                                
+                                # Добавление хеша в консенсус
+                                if self.consensus:
+                                    tx_hash = tx.calculate_hash()
+                                    self.consensus.add_transaction_hash(tx_hash)
             
-            # Создание офлайн транзакций
+            # Создание офлайн транзакций (20% от целевого числа)
             offline_users = [u for u in users if u.offline_wallet_status.value == "ОТКРЫТ" and u.offline_wallet_balance > 0]
-            for _ in range(min(5, len(offline_users))):
-                if len(offline_users) < 2:
-                    break
-                sender = random.choice(offline_users)
-                receiver = random.choice([u for u in offline_users if u.user_id != sender.user_id])
-                
-                amount = min(random.uniform(10, 100), sender.offline_wallet_balance)
-                otx = self.transaction_processor.create_offline_transaction(
-                    sender.user_id, receiver.user_id, amount
-                )
-                if otx:
-                    self._notify_callback('offline_transaction_created', otx)
+            if len(offline_users) >= 2:
+                remaining_time = max(0.1, duration_seconds - elapsed)
+                remaining_tx = target_tx - tx_count
+                if remaining_tx > 0 and remaining_time > 0:
+                    target_rate = remaining_tx / remaining_time
+                    offline_tx_per_iteration = min(20, max(1, int(target_rate * 0.2 * 0.05)))  # 20% офлайн, за 0.05 сек
+                    
+                    for _ in range(offline_tx_per_iteration):
+                        if tx_count >= target_tx:
+                            break
+                        sender = random.choice(offline_users)
+                        receiver = random.choice([u for u in offline_users if u.user_id != sender.user_id and u.offline_wallet_status.value == "ОТКРЫТ"])
+                        
+                        if sender.offline_wallet_balance > 0:
+                            amount = min(random.uniform(10, 100), sender.offline_wallet_balance * 0.9)
+                            otx = self.transaction_processor.create_offline_transaction(
+                                sender.user_id, receiver.user_id, amount
+                            )
+                            if otx:
+                                tx_count += 1
+                                self._notify_callback('offline_transaction_created', otx)
             
-            # Создание смарт-контрактов
-            for _ in range(min(3, len(users))):
-                sender = random.choice(users)
-                receiver = random.choice([u for u in users if u.user_id != sender.user_id])
-                
-                if sender.digital_wallet_balance > 100:
-                    contract_type = random.choice(list(SmartContractType))
-                    amount = min(random.uniform(100, 1000), sender.digital_wallet_balance)
-                    contract = self.transaction_processor.create_smart_contract(
-                        sender.user_id, receiver.user_id, amount, contract_type, 0
-                    )
-                    if contract:
-                        self._notify_callback('smart_contract_created', contract)
+            # Создание смарт-контрактов (20% от целевого числа)
+            smart_contract_senders = [u for u in users if u.user_type == UserType.INDIVIDUAL and u.digital_wallet_status.value == "ОТКРЫТ" and u.digital_wallet_balance > 100]
+            smart_contract_receivers = [u for u in users if u.user_type in [UserType.LEGAL, UserType.CENTRAL_BANK]]
+            if len(smart_contract_senders) > 0 and len(smart_contract_receivers) > 0:
+                remaining_time = max(0.1, duration_seconds - elapsed)
+                remaining_tx = target_tx - tx_count
+                if remaining_tx > 0 and remaining_time > 0:
+                    target_rate = remaining_tx / remaining_time
+                    sc_per_iteration = min(20, max(1, int(target_rate * 0.2 * 0.05)))  # 20% смарт-контракты, за 0.05 сек
+                    
+                    for _ in range(sc_per_iteration):
+                        if tx_count >= target_tx:
+                            break
+                        sender = random.choice(smart_contract_senders)
+                        receiver = random.choice(smart_contract_receivers)
+                        
+                        if sender.digital_wallet_balance > 100:
+                            contract_type = random.choice(list(SmartContractType))
+                            amount = min(random.uniform(100, 1000), sender.digital_wallet_balance * 0.8)
+                            contract = self.transaction_processor.create_smart_contract(
+                                sender.user_id, receiver.user_id, amount, contract_type, 0
+                            )
+                            if contract:
+                                tx_count += 1
+                                self._notify_callback('smart_contract_created', contract)
+            
+            # Выполнение смарт-контрактов (периодически)
+            if current_time - last_smart_contract_execution >= smart_contract_execution_interval:
+                for contract in self.transaction_processor.smart_contracts:
+                    if not contract.executed and datetime.now() >= contract.execution_time:
+                        if self.transaction_processor.execute_smart_contract(contract):
+                            self._notify_callback('smart_contract_created', contract)
+                last_smart_contract_execution = current_time
             
             # Синхронизация офлайн транзакций
             self.transaction_processor.sync_offline_transactions()
@@ -323,12 +449,24 @@ class DigitalRubleSystem:
                     self._notify_callback('block_created', block)
                     self.transaction_processor.clear_pending_transactions()
             
-            # Исполнение смарт-контрактов
-            for contract in self.transaction_processor.smart_contracts:
-                if not contract.executed:
-                    self.transaction_processor.execute_smart_contract(contract)
+            # Дополнительная проверка времени перед задержкой
+            current_time = time.time()
+            elapsed = current_time - start_time
+            if elapsed >= duration_seconds:
+                break
             
-            time.sleep(0.1)  # Небольшая задержка
+            # Небольшая задержка для контроля скорости
+            sleep_time = 0.01  # Уменьшена задержка для более точного контроля времени
+            # Если осталось мало времени, еще больше уменьшаем задержку
+            if elapsed > duration_seconds * 0.8:
+                sleep_time = 0.001
+            time.sleep(sleep_time)
+        
+        # Финальная проверка времени
+        final_time = time.time()
+        final_elapsed = final_time - start_time
+        if final_elapsed > duration_seconds:
+            print(f"Симуляция завершена. Фактическое время: {final_elapsed:.2f}с, заданное: {duration_seconds}с")
         
         self.simulation_running = False
     
@@ -398,12 +536,29 @@ class DigitalRubleSystem:
                 # Узел восстановлен
                 if node_id in self.failed_nodes:
                     self.failed_nodes.remove(node_id)
-                if node_id in self.consensus.nodes:
+                if self.consensus and node_id in self.consensus.nodes:
                     node = self.consensus.nodes[node_id]
-                    node.state = NodeState.FOLLOWER
+                    # Восстановление состояния узла
                     if node.is_central_bank:
+                        # ЦБ всегда становится лидером после восстановления
                         node.state = NodeState.LEADER
                         node.leader_id = node_id
+                        node.current_term += 1
+                        # Если был другой лидер, он должен стать follower
+                        for other_node in self.consensus.nodes.values():
+                            if other_node.node_id != node_id and other_node.state == NodeState.LEADER:
+                                other_node.state = NodeState.FOLLOWER
+                                other_node.leader_id = node_id
+                    else:
+                        # ФО становится follower и синхронизируется с лидером
+                        node.state = NodeState.FOLLOWER
+                        leader = self.consensus.get_leader()
+                        if leader:
+                            node.leader_id = leader.node_id
+                            node.current_term = leader.current_term
+                            # Синхронизация лога
+                            node.log = leader.log.copy()
+                            node.commit_index = leader.commit_index
                 
                 recovery_events.append({
                     'node_id': node_id,
@@ -435,11 +590,15 @@ class DigitalRubleSystem:
         }
         
         total_nodes = len(self.consensus.nodes)
-        active_nodes = [n for n in self.consensus.nodes.values() if n.node_id not in self.failed_nodes]
+        # Исключаем узлы, которые уже в процессе восстановления
+        active_nodes = [n for n in self.consensus.nodes.values() 
+                       if n.node_id not in self.failed_nodes and n.node_id not in self.recovering_nodes]
         
         if incident_type == 'cb_failure':
             # Отказ ЦБ
-            if self.central_bank.bank_id not in self.failed_nodes:
+            cb_node_id = self.central_bank.bank_id
+            # Проверяем, что узел не в failed_nodes и не восстанавливается
+            if cb_node_id not in self.failed_nodes and cb_node_id not in self.recovering_nodes:
                 failed_node = self.central_bank.bank_id
                 self.failed_nodes.append(failed_node)
                 result['stages'].append({
@@ -478,8 +637,11 @@ class DigitalRubleSystem:
         
         elif incident_type == 'fo_1_failure':
             # Отказ 1 ФО
-            fo_nodes = [n for n in self.consensus.nodes.values() if not n.is_central_bank]
-            if fo_nodes and fo_nodes[0].node_id not in self.failed_nodes:
+            fo_nodes = [n for n in self.consensus.nodes.values() 
+                       if not n.is_central_bank 
+                       and n.node_id not in self.failed_nodes 
+                       and n.node_id not in self.recovering_nodes]
+            if fo_nodes:
                 failed_node = fo_nodes[0].node_id
                 self.failed_nodes.append(failed_node)
                 result['stages'].append({
@@ -514,10 +676,13 @@ class DigitalRubleSystem:
         
         elif incident_type == 'fo_2_failure':
             # Отказ 2 ФО
-            fo_nodes = [n for n in self.consensus.nodes.values() if not n.is_central_bank]
+            fo_nodes = [n for n in self.consensus.nodes.values() 
+                       if not n.is_central_bank 
+                       and n.node_id not in self.failed_nodes 
+                       and n.node_id not in self.recovering_nodes]
             failed_nodes_list = []
             for node in fo_nodes[:2]:
-                if node.node_id not in self.failed_nodes:
+                if node.node_id not in self.failed_nodes and node.node_id not in self.recovering_nodes:
                     failed_node = node.node_id
                     self.failed_nodes.append(failed_node)
                     failed_nodes_list.append(failed_node)
@@ -554,9 +719,11 @@ class DigitalRubleSystem:
         
         elif incident_type == 'cb_fo_2_failure':
             # Отказ ЦБ + 2 ФО
+            cb_node_id = self.central_bank.bank_id
             failed_nodes_list = []
-            if self.central_bank.bank_id not in self.failed_nodes:
-                failed_node = self.central_bank.bank_id
+            # Проверяем, что ЦБ не в failed_nodes и не восстанавливается
+            if cb_node_id not in self.failed_nodes and cb_node_id not in self.recovering_nodes:
+                failed_node = cb_node_id
                 self.failed_nodes.append(failed_node)
                 failed_nodes_list.append(failed_node)
                 result['stages'].append({
@@ -565,9 +732,12 @@ class DigitalRubleSystem:
                     'timestamp': datetime.now()
                 })
             
-            fo_nodes = [n for n in self.consensus.nodes.values() if not n.is_central_bank]
+            fo_nodes = [n for n in self.consensus.nodes.values() 
+                       if not n.is_central_bank 
+                       and n.node_id not in self.failed_nodes 
+                       and n.node_id not in self.recovering_nodes]
             for node in fo_nodes[:2]:
-                if node.node_id not in self.failed_nodes:
+                if node.node_id not in self.failed_nodes and node.node_id not in self.recovering_nodes:
                     failed_node = node.node_id
                     self.failed_nodes.append(failed_node)
                     failed_nodes_list.append(failed_node)

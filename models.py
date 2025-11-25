@@ -25,6 +25,8 @@ class TransactionType(Enum):
     ONLINE = "Онлайн транзакция"
     OFFLINE = "Оффлайн транзакция"
     SMART_CONTRACT = "Смарт-контракт"
+    WALLET_TOPUP = "Пополнение цифрового кошелька"
+    OFFLINE_WALLET_TOPUP = "Пополнение офлайн кошелька"
 
 
 class TransactionStatus(Enum):
